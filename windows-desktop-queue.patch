@@ -1,0 +1,620 @@
+diff --git a/bin/workbuddy-gateway.cmd b/bin/workbuddy-gateway.cmd
+new file mode 100644
+index 0000000..2461730
+--- /dev/null
++++ b/bin/workbuddy-gateway.cmd
+@@ -0,0 +1,5 @@
++@echo off
++rem Windows entry point for the Codex <-> WorkBuddy gateway MCP server.
++setlocal
++cd /d "%~dp0.."
++node "%~dp0..\dist\server.js" %*
+diff --git a/scripts/workbuddy-call.mjs b/scripts/workbuddy-call.mjs
+index ccf225f..950817a 100644
+--- a/scripts/workbuddy-call.mjs
++++ b/scripts/workbuddy-call.mjs
+@@ -10,8 +10,12 @@ if (!name || !name.startsWith("workbuddy_")) throw new Error("Usage: node script
+ const parameters = JSON.parse(argument.startsWith("@") ? fs.readFileSync(argument.slice(1), "utf8") : argument);
+ const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+ const client = new Client({ name: "workbuddy-local-client", version: "0.6.0" });
+-// The launcher loads this installation's .env, preserving its queue and Node configuration.
+-const transport = new StdioClientTransport({ command: path.join(root,"bin/workbuddy-gateway"), cwd: root,
++// The POSIX launcher and the Node entry both load this installation's .env and
++// keep its queue/Node configuration; Windows cannot run the sh launcher.
++const launch = process.platform === "win32"
++  ? { command: process.execPath, args: [path.join(root, "dist", "server.js")] }
++  : { command: path.join(root, "bin/workbuddy-gateway"), args: [] };
++const transport = new StdioClientTransport({ command: launch.command, args: launch.args, cwd: root,
+   env: Object.fromEntries(Object.entries(process.env).filter(entry=>typeof entry[1]==="string")),stderr:"inherit" });
+ try {
+   await client.connect(transport);
+diff --git a/src/config.ts b/src/config.ts
+index 412e1d4..c355c92 100644
+--- a/src/config.ts
++++ b/src/config.ts
+@@ -1,4 +1,6 @@
++import os from "node:os";
+ import path from "node:path";
++import { PROJECT_ROOT } from "./env.js";
+ 
+ function optional(name: string): string | undefined {
+   const value = process.env[name]?.trim();
+@@ -51,13 +53,18 @@ export function loadConfig(): Config {
+     clientId: optional("WORKBUDDY_CLIENT_ID"),
+     clientSecret: optional("WORKBUDDY_CLIENT_SECRET"),
+     accessToken: optional("WORKBUDDY_ACCESS_TOKEN"),
+-    tokenFile: path.resolve(optional("WORKBUDDY_TOKEN_FILE") ?? "./data/credentials.json"),
+-    dbFile: path.resolve(optional("WORKBUDDY_DB_FILE") ?? "./data/tasks.sqlite"),
++    // Relative paths belong to this installation, not to the caller's working
++    // directory; the sh launchers enforced that with `cd $ROOT`, and the queue
++    // helper now runs from whatever directory the desktop conversation uses.
++    tokenFile: path.resolve(PROJECT_ROOT, optional("WORKBUDDY_TOKEN_FILE") ?? "./data/credentials.json"),
++    dbFile: path.resolve(PROJECT_ROOT, optional("WORKBUDDY_DB_FILE") ?? "./data/tasks.sqlite"),
+     oauthRedirectUri: optional("WORKBUDDY_OAUTH_REDIRECT_URI") ?? "http://127.0.0.1:8787/oauth/callback",
+     oauthPort: integer("WORKBUDDY_OAUTH_PORT", 8787),
+     oauthScopes: optional("WORKBUDDY_OAUTH_SCOPES") ?? "user.localassistant.invokable user.localassistant.readable",
+     requestTimeoutMs: integer("WORKBUDDY_REQUEST_TIMEOUT_MS", 30_000),
+-    cliElectronPath: optional("WORKBUDDY_CLI_ELECTRON") ?? "/Applications/WorkBuddy.app/Contents/MacOS/Electron",
++    cliElectronPath: optional("WORKBUDDY_CLI_ELECTRON") ?? (process.platform === "win32"
++      ? path.join(process.env.LOCALAPPDATA ?? os.homedir(), "Programs", "WorkBuddy", "WorkBuddy.exe")
++      : "/Applications/WorkBuddy.app/Contents/MacOS/Electron"),
+     cliScriptPath: optional("WORKBUDDY_CLI_SCRIPT") ?? "/Applications/WorkBuddy.app/Contents/Resources/app.asar/cli/bin/codebuddy",
+     cliPermissionMode: optional("WORKBUDDY_CLI_PERMISSION_MODE") ?? "acceptEdits",
+     // Allow one explicit WorkBuddy action by default so delegated coding
+@@ -66,10 +73,12 @@ export function loadConfig(): Config {
+     acpPermissionMode: optional("WORKBUDDY_ACP_PERMISSION_MODE") === "deny" ? "deny" : "allow_once",
+     gatewayUrl: (optional("WORKBUDDY_GATEWAY_URL") ?? "http://127.0.0.1:64523").replace(/\/$/, ""),
+     gatewayPassword: optional("WORKBUDDY_GATEWAY_PASSWORD"),
+-    workbuddyConfigDir: optional("WORKBUDDY_CONFIG_DIR") ?? path.join(process.env.HOME ?? "", ".workbuddy"),
+-    runsDir: optional("WORKBUDDY_RUNS_DIR") ? path.resolve(optional("WORKBUDDY_RUNS_DIR")!) : undefined,
++    // The native app keeps its history database under the user's home on every
++    // platform; process.env.HOME is empty on Windows, so resolve the real home.
++    workbuddyConfigDir: optional("WORKBUDDY_CONFIG_DIR") ?? path.join(os.homedir(), ".workbuddy"),
++    runsDir: optional("WORKBUDDY_RUNS_DIR") ? path.resolve(PROJECT_ROOT, optional("WORKBUDDY_RUNS_DIR")!) : undefined,
+     taskTimeoutSeconds: Math.min(integer("WORKBUDDY_TASK_TIMEOUT_SECONDS", 1800), 86_400),
+-    serviceConfigFile: path.resolve(optional("WORKBUDDY_SERVICE_CONFIG") ?? "./data/persistent-service.json"),
++    serviceConfigFile: path.resolve(PROJECT_ROOT, optional("WORKBUDDY_SERVICE_CONFIG") ?? "./data/persistent-service.json"),
+   };
+ }
+ 
+diff --git a/src/desktop-queue.ts b/src/desktop-queue.ts
+index d55e329..6935613 100644
+--- a/src/desktop-queue.ts
++++ b/src/desktop-queue.ts
+@@ -5,6 +5,7 @@ import { execFileSync } from "node:child_process";
+ import { fileURLToPath } from "node:url";
+ import type { Config } from "./config.js";
+ import { readDesktopSession } from "./desktop-runtime.js";
++import { sameExecutable, windowsProcessTable } from "./native-process.js";
+ import { DurableRuns, RunJournal, runsDirectory, writePrivateJson, type RunRequest, type RunSnapshot } from "./run-journal.js";
+ import { TaskStore } from "./task-store.js";
+ import type { LocalMessage } from "./workbuddy-client.js";
+@@ -21,6 +22,7 @@ export interface QueueTask {
+ 
+ /** Prove the helper was launched by the native desktop app, not a standalone CLI or Codex. */
+ export function assertDesktopCaller(config: Config): DesktopActor {
++  if (process.platform === "win32") return assertDesktopCallerWindows(config);
+   let pid = process.ppid;
+   const executable = path.resolve(config.cliElectronPath);
+   for (let step = 0; pid > 1 && step < 30; step++) {
+@@ -38,6 +40,25 @@ export function assertDesktopCaller(config: Config): DesktopActor {
+   throw new Error("This worker helper must be called from the real WorkBuddy desktop conversation. Standalone CLI and Codex-side execution cannot report WorkBuddy results.");
+ }
+ 
++/**
++ * Windows equivalent of the parent-chain proof above. The helper is started by
++ * the native app's own shell tool, so walking ParentProcessId must reach the
++ * WorkBuddy process that owns this configuration.
++ */
++function assertDesktopCallerWindows(config: Config): DesktopActor {
++  const byPid = new Map(windowsProcessTable().map((row) => [row.pid, row]));
++  let pid = process.ppid;
++  for (let step = 0; pid > 0 && step < 30; step++) {
++    const row = byPid.get(pid);
++    if (!row) break;
++    const command = row.commandLine ?? "";
++    if (sameExecutable(row.exe, config.cliElectronPath) && !/--type=|--stdio|sidecar-entry|daemon-app-server|cli[\\/]bin/i.test(command)) return { desktopPid: pid };
++    if (row.ppid === pid) break;
++    pid = row.ppid;
++  }
++  throw new Error("This worker helper must be called from the real WorkBuddy desktop conversation. Standalone CLI and Codex-side execution cannot report WorkBuddy results.");
++}
++
+ function alive(pid: number): boolean { try { process.kill(pid, 0); return true; } catch { return false; } }
+ function key(sessionId: string): string { return crypto.createHash("sha256").update(sessionId).digest("hex"); }
+ function readJson<T>(file: string): T | undefined {
+@@ -69,15 +90,23 @@ export class DesktopQueue {
+   prepare(sessionId: string, persistent = false, wakeOnce = false) {
+     const evidence = readDesktopSession(this.config.workbuddyConfigDir, sessionId);
+     if (!evidence.registered) throw new Error(evidence.reason ?? "Desktop session unregistered");
+-    const helper = fileURLToPath(new URL("../bin/workbuddy-worker", import.meta.url));
+     const quote = (value: string) => `'${value.replaceAll("'", "'\\''")}'`;
++    // Windows cannot execute the POSIX launcher, so hand WorkBuddy an explicit
++    // Node command that works from its own shell tool on either platform.
++    // Forward slashes keep the command valid in both bash and Windows shells.
++    const winPath = (value: string) => value.replaceAll("\\", "/");
++    const helper = process.platform === "win32"
++      ? `${quote(winPath(process.execPath))} ${quote(winPath(fileURLToPath(new URL("../dist/desktop-worker-cli.js", import.meta.url))))}`
++      : quote(fileURLToPath(new URL("../bin/workbuddy-worker", import.meta.url)));
+     if (persistent) {
+       if (!evidence.cwd || !path.isAbsolute(evidence.cwd)) throw new Error("Persistent setup needs the native session's absolute workspace");
+-      const service = fileURLToPath(new URL("../bin/workbuddy-service", import.meta.url));
++      const service = process.platform === "win32"
++        ? `${quote(winPath(process.execPath))} ${quote(winPath(fileURLToPath(new URL("../dist/service-cli.js", import.meta.url))))}`
++        : quote(fileURLToPath(new URL("../bin/workbuddy-service", import.meta.url)));
+       return { sessionId, workspace: evidence.cwd, started: false, mode: "persistent", prompt: `请一次性配置本桌面会话为 Codex 的常驻执行会话。会话 ID：${sessionId}。用户授权安装本机服务，并在需要启用原生接口时、其他任务结束后自动重启 WorkBuddy 一次。\n请用你自己的 Bash 工具执行：\n${quote(service)} install --session-id ${quote(sessionId)} --workspace ${quote(evidence.cwd)} --cdp-port 18491\n安装完成只回报安装状态或真实错误，结束当前回复。不要启动无限 claim，不改桥接器源码，不写其他成果或记忆，不改变权限设置。服务会保存会话绑定、按真实队列自动唤起本会话，退出和重开后无需再次粘贴。安装成功不等于任务通过；后续仍需实际领取、产物和验收证明。需要登录或原生权限时如实说明。` };
+     }
+     const waiting = wakeOnce ? "关键：本次由常驻服务按任务唤起。完成 report 后只再运行一次 claim --wait-seconds 0；若有任务则实际执行并报告，若 status=retry 则结束本轮。不要循环空等；新任务和后续返工由常驻服务自动重新唤起，无需用户粘贴。" : "关键：回报之后不要结束当前轮次，立即再次运行 claim，等待 Codex 的检查和返工任务；下一任务必须按新的 attemptId 和 leaseToken 执行。status=retry 表示暂时没有任务，最多连续重试 4 次（每次最多 50 秒）；领取任务后重置空等计数。连续四次空等后结束并明确说明监听已停止，需要重新启动。长命令若转后台，等待该命令输出后再决定下一步，不要并行启动多个 claim。";
+-    return { sessionId, workspace: evidence.cwd, started: false, prompt: `请将本桌面会话用作 Codex 任务队列的执行会话。会话 ID：${sessionId}。这是启动监听，具体工作只按领取到的任务执行。\n使用你自己的 Bash 工具执行下面的本机命令（不能由 Codex 代执行）：\n${quote(helper)} claim --session-id ${quote(sessionId)} --wait-seconds 50\n若返回 status=task，读取完整 prompt，遵守目标、约束和验收要求，用 WorkBuddy 本会话自己的工具实际执行。保留返回的 attemptId、sessionId、leaseToken，不要猜测或复用旧轮次。完成后通过同一个 helper 的 report 命令回报：--session-id、--attempt-id、--lease-token 必须使用本轮值；--status 使用 completed、blocked 或 failed；--text 写实际结果（包括 TASK_STATUS、FILES_CHANGED、COMMANDS_RUN、TEST_RESULT、REMAINING_PROBLEMS）；--artifacts 使用真实绝对路径组成的 JSON 数组。命令参数用安全的 shell 引号。空报告、只有计划或没有实际产物不能报 completed。可用 progress 命令（相同身份参数和 --text）上报进度并检查 cancellationRequested；取消时停止当前任务并如实 report。\n${waiting}\n不要为了领取任务而修改本桥接器实现、WorkBuddy 数据库或安全设置；不要提取账号凭据。遇到权限或输入请求遵守 WorkBuddy 桌面现有设置，需要人操作则明确说明。helper 只传递任务和回报，不替你制作成果。` };
++    return { sessionId, workspace: evidence.cwd, started: false, prompt: `请将本桌面会话用作 Codex 任务队列的执行会话。会话 ID：${sessionId}。这是启动监听，具体工作只按领取到的任务执行。\n使用你自己的 Bash 工具执行下面的本机命令（不能由 Codex 代执行）：\n${helper} claim --session-id ${quote(sessionId)} --wait-seconds 50\n若返回 status=task，读取完整 prompt，遵守目标、约束和验收要求，用 WorkBuddy 本会话自己的工具实际执行。保留返回的 attemptId、sessionId、leaseToken，不要猜测或复用旧轮次。完成后通过同一个 helper 的 report 命令回报：--session-id、--attempt-id、--lease-token 必须使用本轮值；--status 使用 completed、blocked 或 failed；--text 写实际结果（包括 TASK_STATUS、FILES_CHANGED、COMMANDS_RUN、TEST_RESULT、REMAINING_PROBLEMS）；--artifacts 使用真实绝对路径组成的 JSON 数组。命令参数用安全的 shell 引号。空报告、只有计划或没有实际产物不能报 completed。可用 progress 命令（相同身份参数和 --text）上报进度并检查 cancellationRequested；取消时停止当前任务并如实 report。\n${waiting}\n不要为了领取任务而修改本桥接器实现、WorkBuddy 数据库或安全设置；不要提取账号凭据。遇到权限或输入请求遵守 WorkBuddy 桌面现有设置，需要人操作则明确说明。helper 只传递任务和回报，不替你制作成果。` };
+   }
+   listeners(): Array<{sessionId: string; workspace?: string; ready: boolean; source: string}> {
+     if (!fs.existsSync(this.listenersDir)) return [];
+diff --git a/src/desktop-worker-cli.ts b/src/desktop-worker-cli.ts
+index 3fca43c..cb90d5d 100644
+--- a/src/desktop-worker-cli.ts
++++ b/src/desktop-worker-cli.ts
+@@ -1,6 +1,9 @@
+ import { parseArgs } from "node:util";
+ import { loadConfig } from "./config.js";
+ import { DesktopQueue } from "./desktop-queue.js";
++import { loadDotEnv } from "./env.js";
++
++loadDotEnv();
+ 
+ try {
+   const parsed = parseArgs({ allowPositionals: true, options: {
+diff --git a/src/doctor.ts b/src/doctor.ts
+index fee9d11..0c2795c 100644
+--- a/src/doctor.ts
++++ b/src/doctor.ts
+@@ -1,9 +1,11 @@
+ import fs from "node:fs";
+ import { loadConfig } from "./config.js";
+ import { WorkBuddyClient } from "./workbuddy-client.js";
++import { loadDotEnv } from "./env.js";
+ 
+ // This command intentionally sends no prompt, changes no desktop setting and
+ // prints no token, cookie, private workspace or session-file path.
++loadDotEnv();
+ const config = loadConfig();
+ const [major = 0, minor = 0] = process.versions.node.split(".").map(Number);
+ const nodeSupported = major > 22 || (major === 22 && minor >= 5);
+diff --git a/src/env.ts b/src/env.ts
+new file mode 100644
+index 0000000..2229e03
+--- /dev/null
++++ b/src/env.ts
+@@ -0,0 +1,36 @@
++import fs from "node:fs";
++import path from "node:path";
++import { fileURLToPath } from "node:url";
++
++/** Absolute path of this installation, independent of the caller's cwd. */
++export const PROJECT_ROOT = fileURLToPath(new URL("../", import.meta.url));
++
++/**
++ * Load this installation's .env the way the POSIX launchers do.
++ *
++ * The sh launchers in bin/ source .env before starting Node; environments that
++ * cannot run a sh launcher (Windows, editors, MCP hosts) call this instead.
++ * Values already present in the environment always win, so the .env file can
++ * never override an explicit host configuration.
++ */
++export function loadDotEnv(file: string = path.join(PROJECT_ROOT, ".env")): void {
++  let text: string;
++  try {
++    text = fs.readFileSync(file, "utf8");
++  } catch {
++    return;
++  }
++  for (const raw of text.split(/\r?\n/)) {
++    const line = raw.trim();
++    if (!line || line.startsWith("#")) continue;
++    const separator = line.indexOf("=");
++    if (separator <= 0) continue;
++    const name = line.slice(0, separator).trim();
++    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(name)) continue;
++    let value = line.slice(separator + 1).trim();
++    if (value.length >= 2 && ((value.startsWith("'") && value.endsWith("'")) || (value.startsWith('"') && value.endsWith('"')))) {
++      value = value.slice(1, -1);
++    }
++    if (process.env[name] === undefined) process.env[name] = value;
++  }
++}
+diff --git a/src/native-desktop-trigger.ts b/src/native-desktop-trigger.ts
+index 34979b1..ee8063a 100644
+--- a/src/native-desktop-trigger.ts
++++ b/src/native-desktop-trigger.ts
+@@ -4,6 +4,11 @@ import { execFileSync, spawn } from "node:child_process";
+ import { DatabaseSync } from "node:sqlite";
+ import type { Config } from "./config.js";
+ import type { NativeDesktopTrigger } from "./persistent-service.js";
++import { hasProcess, sameExecutable, windowsProcessTable } from "./native-process.js";
++
++// The desktop route began on macOS; these branches add the Windows equivalent
++// (tasklist/netstat + WM_CLOSE relaunch) without changing the macOS behaviour.
++const WINDOWS = process.platform === "win32";
+ 
+ // The renderer forwards requests into the desktop's existing local daemon.
+ // No UI controls, account tokens, CLI host or model are created by this code.
+@@ -91,6 +96,14 @@ export const RENDERER_BRIDGE = String.raw`(async function(){
+     if(markers.get(sid)?.has(wakeId))return {accepted:true,receipt:wakeId};
+     const state=await inspect(sid);
+     if(state.state!=='idle'||outgoing.has(sid))return {accepted:false};
++    // A created session is not opened in the renderer yet. Several desktop
++    // builds drop session:sendMessage until the conversation is loaded, and the
++    // prompt then never reaches the native history. Load it first when needed.
++    try{
++      const active=await rpc('daemon:getActiveSessions',[]);
++      const already=Array.isArray(active)&&active.some(s=>(s&&(s.sessionId||s.id)===sid)||(s&&state.workspace&&s.cwd===state.workspace));
++      if(!already){const session=await rpc('session:get',[sid]);await rpc('session:load',[sid,{cwd:state.workspace||session?.cwd,forceRendererHistoryReplay:true}],45000);}
++    }catch{}
+     // Lock before sending. Native sendMessage has no independent busy rejection.
+     const operation={wakeId,error:undefined};outgoing.set(sid,operation);
+     try{if(model)await applyModel(sid,model);}catch(error){outgoing.delete(sid);return {accepted:false,error:error.message};}
+@@ -104,11 +117,14 @@ export const RENDERER_BRIDGE = String.raw`(async function(){
+     }
+     throw Error('Native submission receipt is uncertain; do not automatically replay');
+   };
++  // Windows returns the native cwd with backslashes; compare normalized paths
++  // instead of raw strings so a real creation is not reported as a mismatch.
++  const samePath=(a,b)=>{const n=v=>String(v??'').replace(/\\/g,'/').replace(/\/+$/,'');if(n(a)===n(b))return true;return /^[a-zA-Z]:\//.test(n(a))&&n(a).toLowerCase()===n(b).toLowerCase();};
+   const createWorker=async(workspace,sessionId,title)=>{
+     const initialized=await rpc('workspace:initialize',[{cwd:workspace}]);
+     if(!initialized?.success)throw Error(initialized?.error||'Native workspace initialization failed');
+     const created=await rpc('session:create',[{cwd:workspace,sessionId,isPlayground:false}],45000);
+-    if(created?.sessionId!==sessionId||created?.cwd!==workspace)throw Error('Native session creation returned a different identity or workspace; do not replay');
++    if(created?.sessionId!==sessionId||!samePath(created?.cwd,workspace))throw Error('Native session creation returned a different identity or workspace; do not replay');
+     if(title)await rpc('session:rename',[sessionId,title]);
+     return {sessionId:created.sessionId,workspace:created.cwd};
+   };
+@@ -148,6 +164,7 @@ export class NativeDesktopRpcTrigger implements NativeDesktopTrigger {
+   }
+ 
+   private portState(): "absent" | "native" | "foreign" | "unavailable" {
++    if (WINDOWS) return this.portStateWindows();
+     let output:string;
+     try {
+       output = this.processControl.run("/usr/sbin/lsof", ["-nP", `-iTCP:${this.cdpPort}`, "-sTCP:LISTEN", "-Fp"], 3000);
+@@ -159,21 +176,63 @@ export class NativeDesktopRpcTrigger implements NativeDesktopTrigger {
+     } catch {return "unavailable";}
+   }
+ 
++  /** Windows port ownership is proven by the process that listens on it. */
++  private portStateWindows(): "absent" | "native" | "foreign" | "unavailable" {
++    let output: string;
++    try { output = this.processControl.run("netstat", ["-ano", "-p", "tcp"], 10_000); }
++    catch { return "unavailable"; }
++    const pids: number[] = [];
++    for (const line of output.split(/\r?\n/)) {
++      const match = line.trim().match(/^TCP\s+\S+:(\d+)\s+\S+\s+LISTENING\s+(\d+)$/i);
++      if (match && Number(match[1]) === this.cdpPort && Number(match[2]) > 0) pids.push(Number(match[2]));
++    }
++    if (pids.length === 0) return "absent";
++    try {
++      const table = windowsProcessTable();
++      return pids.length === 1 && table.some((row) => row.pid === pids[0] && sameExecutable(row.exe, this.config.cliElectronPath)) ? "native" : "foreign";
++    } catch { return "unavailable"; }
++  }
++
+   private ownerIsNative(): boolean {
+     return this.portState()==="native";
+   }
+ 
+   private nativePids(): number[] {
++    if (WINDOWS) return this.nativePidsWindows();
+     const executable=path.resolve(this.config.cliElectronPath);
+     const output = this.processControl.run("/bin/ps", ["-axo", "pid=,command="], 3000);
+     return output.split("\n").flatMap(line => {const match=line.trim().match(/^(\d+)\s+(.+)$/);const command=match?.[2]??"";return match && (command===executable||command.startsWith(executable+" --"))&&!/--type=|--stdio|cli\/bin|sidecar-entry|daemon-app-server/.test(command) ? [Number(match[1])] : [];});
+   }
+ 
++  /** Root WorkBuddy processes: the executable matches and it is not a helper child. */
++  private nativePidsWindows(): number[] {
++    const executable = this.config.cliElectronPath;
++    return windowsProcessTable()
++      .filter((row) => sameExecutable(row.exe, executable) && !/--type=|--stdio|sidecar-entry|daemon-app-server|cli[\\/]bin/i.test(row.commandLine ?? ""))
++      .map((row) => row.pid);
++  }
++
+   private rootPidExists(pid:number): boolean {
++    if (WINDOWS) return hasProcess(pid);
+     try {return this.processControl.run("/bin/ps",["-p",String(pid),"-o","pid="],3000).trim()===String(pid);}
+     catch(error){if(noProcessMatch(error))return false;throw error;}
+   }
+ 
++  /**
++   * Close the native app the way the ordinary quit command does, then wait for
++   * it to disappear so the startup switch can be applied by a fresh launch.
++   */
++  private async quitNativeWindows(pid: number): Promise<boolean> {
++    try { this.processControl.run("taskkill", ["/PID", String(pid)], 10_000); } catch { /* already gone */ }
++    for (let retry = 0; retry < 40 && hasProcess(pid); retry++) await this.processControl.pause(250);
++    if (!hasProcess(pid)) return true;
++    // WM_CLOSE was ignored (for example the app is minimized to the tray). The
++    // history database is WAL-journaled, so one forced restart stays recoverable.
++    try { this.processControl.run("taskkill", ["/F", "/PID", String(pid)], 10_000); } catch { /* already gone */ }
++    for (let retry = 0; retry < 20 && hasProcess(pid); retry++) await this.processControl.pause(250);
++    return !hasProcess(pid);
++  }
++
+   private canEnablePortWithoutInterruptingWork(): boolean {
+     let db:DatabaseSync|undefined;
+     try {
+@@ -187,6 +246,7 @@ export class NativeDesktopRpcTrigger implements NativeDesktopTrigger {
+   }
+ 
+   private async discover(): Promise<string> {
++    if (WINDOWS) return this.discoverWindows();
+     const portState=this.portState();
+     if(portState==="foreign"||portState==="unavailable")throw new Error("Registered local port is occupied by another process or its owner cannot be verified; WorkBuddy was left running");
+     if (portState!=="native") {
+@@ -220,6 +280,36 @@ export class NativeDesktopRpcTrigger implements NativeDesktopTrigger {
+     return target.webSocketDebuggerUrl;
+   }
+ 
++  private async discoverWindows(): Promise<string> {
++    const portState = this.portStateWindows();
++    if (portState === "foreign" || portState === "unavailable") throw new Error("Registered local port is occupied by another process or its owner cannot be verified; WorkBuddy was left running");
++    if (portState !== "native") {
++      if (!this.autoLaunch) throw new Error("Native desktop is offline");
++      const running = this.nativePidsWindows();
++      if (running.length) {
++        if (running.length !== 1 || !this.canEnablePortWithoutInterruptingWork()) throw new Error("Waiting for native WorkBuddy tasks to finish before enabling its persistent local port");
++        const rootPid = running[0]!;
++        if (this.nativePidsWindows().length !== 1 || this.nativePidsWindows()[0] !== rootPid || this.portStateWindows() !== "absent") throw new Error("Native WorkBuddy changed during setup; no restart was requested");
++        if (!await this.quitNativeWindows(rootPid)) throw new Error("Native WorkBuddy did not finish its graceful setup restart");
++        if (this.nativePidsWindows().length) throw new Error("Another WorkBuddy root appeared during setup; no replacement was launched");
++      }
++      if (this.portStateWindows() !== "absent") throw new Error("Registered local port changed during setup; no replacement was launched");
++      if (!fs.statSync(this.config.cliElectronPath).isFile()) throw new Error("WorkBuddy desktop executable is missing");
++      this.processControl.launch(this.config.cliElectronPath, this.cdpPort);
++      for (let retry = 0; retry < 60 && !this.ownerIsNative(); retry++) await this.processControl.pause(250);
++      if (!this.ownerIsNative()) throw new Error("Native WorkBuddy local RPC port did not become available");
++    }
++    const response = await fetch(`http://127.0.0.1:${this.cdpPort}/json/list`, { signal: AbortSignal.timeout(4000) });
++    const targets = await response.json() as Array<{type?:string;url?:string;webSocketDebuggerUrl?:string}>;
++    // Windows reports the renderer as file:///D:/<app>/resources/app.asar/renderer/index.html.
++    const appAsar = path.join(path.dirname(path.resolve(this.config.cliElectronPath)), "resources", "app.asar").replaceAll("\\", "/").toLowerCase();
++    const target = targets.find((item) => item.type === "page" && typeof item.url === "string" && item.webSocketDebuggerUrl && item.url.toLowerCase().includes(appAsar) && !item.url.toLowerCase().includes("splash"));
++    if (!target?.webSocketDebuggerUrl) throw new Error("WorkBuddy main renderer is not ready");
++    const url = new URL(target.webSocketDebuggerUrl);
++    if (!['127.0.0.1','localhost'].includes(url.hostname) || Number(url.port) !== this.cdpPort || url.protocol !== 'ws:') throw new Error("Native debugger target is not the registered loopback endpoint");
++    return target.webSocketDebuggerUrl;
++  }
++
+   private async connect(): Promise<void> {
+     if (this.socket?.readyState === WebSocket.OPEN) return;
+     if (this.connection) return this.connection;
+diff --git a/src/native-process.ts b/src/native-process.ts
+new file mode 100644
+index 0000000..c17db93
+--- /dev/null
++++ b/src/native-process.ts
+@@ -0,0 +1,53 @@
++import path from "node:path";
++import { execFileSync } from "node:child_process";
++
++export interface NativeProcess {
++  pid: number;
++  ppid: number;
++  exe?: string;
++  commandLine?: string;
++}
++
++/**
++ * Read the Windows process table once through the OS. This only inspects
++ * process metadata: it never starts, stops or reconfigures another program.
++ */
++export function windowsProcessTable(): NativeProcess[] {
++  const script = "Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId,ExecutablePath,CommandLine | ConvertTo-Json -Compress -Depth 3";
++  const output = execFileSync("powershell", ["-NoProfile", "-NonInteractive", "-Command", script], {
++    encoding: "utf8",
++    timeout: 30_000,
++    maxBuffer: 64 * 1024 * 1024,
++  }).trim();
++  if (!output) return [];
++  const parsed = JSON.parse(output) as unknown;
++  const rows = Array.isArray(parsed) ? parsed : [parsed];
++  return rows.flatMap((row) => {
++    const value = row as Record<string, unknown>;
++    const pid = Number(value.ProcessId);
++    const ppid = Number(value.ParentProcessId);
++    if (!Number.isSafeInteger(pid) || pid <= 0) return [];
++    return [{
++      pid,
++      ppid: Number.isSafeInteger(ppid) ? ppid : 0,
++      exe: typeof value.ExecutablePath === "string" ? value.ExecutablePath : undefined,
++      commandLine: typeof value.CommandLine === "string" ? value.CommandLine : undefined,
++    }];
++  });
++}
++
++export function hasProcess(pid: number, table?: NativeProcess[]): boolean {
++  if (!Number.isSafeInteger(pid) || pid <= 0) return false;
++  const rows = table ?? windowsProcessTable();
++  return rows.some((row) => row.pid === pid);
++}
++
++/** Compare an executable path from the process table with a configured path. */
++export function sameExecutable(candidate: string | undefined, configured: string): boolean {
++  if (!candidate) return false;
++  try {
++    return path.resolve(candidate).toLowerCase() === path.resolve(configured).toLowerCase();
++  } catch {
++    return false;
++  }
++}
+diff --git a/src/persistent-service.ts b/src/persistent-service.ts
+index e7e5e35..7dccf20 100644
+--- a/src/persistent-service.ts
++++ b/src/persistent-service.ts
+@@ -93,10 +93,17 @@ function writeWakeIntent(file: string, intent: WakeIntent): void {
+   writePrivateJson(file, intent);
+   // Force the intent and renamed directory entry to stable storage before native
+   // submission. A machine restart must not erase our evidence of possible delivery.
+-  const fd = fs.openSync(file, "r");
+-  try { fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
+-  const directory = fs.openSync(path.dirname(file), "r");
+-  try { fs.fsyncSync(directory); } finally { fs.closeSync(directory); }
++  // Windows rejects FlushFileBuffers on read-only handles and on directories, so
++  // keep the flush best effort there instead of failing the whole wake; the
++  // rename itself is still atomic and journaled by NTFS.
++  let fd: number | undefined;
++  try { fd = fs.openSync(file, process.platform === "win32" ? "r+" : "r"); fs.fsyncSync(fd); }
++  catch { /* Best-effort durability; delivery evidence is still written. */ }
++  finally { if (fd !== undefined) fs.closeSync(fd); }
++  if (process.platform !== "win32") {
++    const directory = fs.openSync(path.dirname(file), "r");
++    try { fs.fsyncSync(directory); } finally { fs.closeSync(directory); }
++  }
+ }
+ 
+ /** SQLite CAS avoids two recovering daemons reclaiming the same stale file lock. */
+diff --git a/src/server.ts b/src/server.ts
+index 43c1cf4..99df5fa 100644
+--- a/src/server.ts
++++ b/src/server.ts
+@@ -13,7 +13,11 @@ import { serviceStatus } from "./service-cli.js";
+ import { readServiceRegistration } from "./persistent-service.js";
+ import path from "node:path";
+ import { ensureWorkspace, listWorkspaces, listModels } from "./workspace-manager.js";
++import { loadDotEnv } from "./env.js";
+ 
++// Load this installation's .env so the MCP host does not have to export it or
++// run the POSIX launcher. Explicit host variables always win.
++loadDotEnv();
+ const config = loadConfig();
+ const client = new WorkBuddyClient(config);
+ const store = new TaskStore(config.dbFile);
+diff --git a/src/service-cli.ts b/src/service-cli.ts
+index 0a21112..4774713 100644
+--- a/src/service-cli.ts
++++ b/src/service-cli.ts
+@@ -1,10 +1,12 @@
+ import fs from "node:fs";
++import os from "node:os";
+ import path from "node:path";
+ import crypto from "node:crypto";
+-import { spawnSync } from "node:child_process";
++import { spawn, spawnSync } from "node:child_process";
+ import { fileURLToPath } from "node:url";
+ import { parseArgs } from "node:util";
+ import { loadConfig, type Config } from "./config.js";
++import { loadDotEnv } from "./env.js";
+ import { TaskStore } from "./task-store.js";
+ import { readDesktopSession } from "./desktop-runtime.js";
+ import { runsDirectory, writePrivateJson } from "./run-journal.js";
+@@ -12,6 +14,9 @@ import { pumpWorkspaceWorkers, recoverExpiredAttempt, readServiceRegistration, r
+ import { WorkspaceWorkers, readWorkspaceWorkers } from "./workspace-workers.js";
+ 
+ const DEBUG_ENV = "WORKBUDDY_REMOTE_DEBUGGING_PORT";
++const WINDOWS = process.platform === "win32";
++function isAlive(pid: number): boolean { try { process.kill(pid, 0); return true; } catch { return false; } }
++loadDotEnv();
+ interface CommandResult { status: number; stdout: string; stderr?: string }
+ export type LaunchctlRunner = (args: string[]) => CommandResult;
+ const launchctl: LaunchctlRunner = (args) => {
+@@ -56,7 +61,9 @@ export interface InstallServiceOptions {
+ }
+ 
+ export function installService(options: InstallServiceOptions, run: LaunchctlRunner = launchctl): { ok: true; registration: ServiceRegistration; configFile: string; restartWorkBuddyRequired: boolean } {
+-  if ((options.platform ?? process.platform) !== "darwin") throw new Error("Persistent desktop service installation requires macOS launchd");
++  const platform = options.platform ?? process.platform;
++  if (platform === "win32") return installServiceWindows(options);
++  if (platform !== "darwin") throw new Error("Persistent desktop service installation requires macOS launchd");
+   const projectDir = fs.realpathSync(options.projectDir);
+   // Keep the native session's path spelling (macOS /var may alias /private/var).
+   const workspace = path.resolve(options.workspace);
+@@ -115,16 +122,63 @@ export function installService(options: InstallServiceOptions, run: LaunchctlRun
+   return { ok: true, registration, configFile, restartWorkBuddyRequired: !currentEnv.present || currentEnv.value !== String(registration.cdpPort) };
+ }
+ 
++/** Logon entry that restarts the supervising service after a reboot or sign-in. */
++function windowsStartupEntry(projectDir: string): string {
++  const appData = process.env.APPDATA ?? path.join(os.homedir(), "AppData", "Roaming");
++  const label = `codex-workbuddy-service-${crypto.createHash("sha256").update(projectDir).digest("hex").slice(0, 12)}`;
++  return path.join(appData, "Microsoft", "Windows", "Start Menu", "Programs", "Startup", `${label}.cmd`);
++}
++
++function startWindowsService(registration: ServiceRegistration, configFile: string): void {
++  const child = spawn(registration.nodeBin, [path.join(registration.projectDir, "dist", "service-cli.js"), "run", "--config", configFile], {
++    cwd: registration.projectDir, detached: true, stdio: "ignore", windowsHide: true,
++  });
++  child.on("error", () => undefined);
++  child.unref();
++}
++
++/**
++ * Windows has no launchd. The same supervision loop runs as a detached Node
++ * process, started now and re-started at logon through the Startup folder.
++ */
++export function installServiceWindows(options: InstallServiceOptions): { ok: true; registration: ServiceRegistration; configFile: string; restartWorkBuddyRequired: boolean } {
++  const projectDir = fs.realpathSync(options.projectDir);
++  const workspace = path.resolve(options.workspace);
++  if (!fs.statSync(workspace).isDirectory()) throw new Error("The worker workspace must be a directory");
++  const nodeBin = fs.realpathSync(options.nodeBin ?? process.execPath);
++  if (!fs.statSync(nodeBin).isFile()) throw new Error("The service Node executable was not found");
++  if (!fs.existsSync(path.join(projectDir, "dist", "service-cli.js"))) throw new Error("Build the project before installing its persistent service");
++  const evidence = readDesktopSession(options.config.workbuddyConfigDir, options.sessionId);
++  if (!evidence.registered) throw new Error(evidence.reason ?? "The dedicated WorkBuddy desktop session is not registered");
++  if (evidence.cwd && path.resolve(evidence.cwd) !== workspace) throw new Error("The selected WorkBuddy desktop session uses another workspace");
++  const configFile = serviceRegistrationPath(projectDir);
++  const registration: ServiceRegistration = {
++    version: 1, sessionId: options.sessionId, workspace, projectDir, nodeBin, cdpPort: options.cdpPort,
++    dbFile: options.config.dbFile, runsDir: runsDirectory(options.config), workbuddyConfigDir: options.config.workbuddyConfigDir, cliElectronPath: options.config.cliElectronPath,
++    intervalMs: options.intervalMs ?? 1500, installedAt: new Date().toISOString(),
++  };
++  validateServiceRegistration(registration);
++  fs.mkdirSync(path.join(projectDir, "data", "service-logs"), { recursive: true });
++  writePrivateJson(configFile, registration);
++  const entry = windowsStartupEntry(projectDir);
++  fs.mkdirSync(path.dirname(entry), { recursive: true });
++  fs.writeFileSync(entry, `@echo off\r\ncd /d "${projectDir}"\r\n"${nodeBin}" "${path.join(projectDir, "dist", "service-cli.js")}" run --config "${configFile}"\r\n`, "utf8");
++  startWindowsService(registration, configFile);
++  return { ok: true, registration, configFile, restartWorkBuddyRequired: false };
++}
++
+ export function serviceStatus(configFile: string, run: LaunchctlRunner = launchctl, uid = process.getuid?.()): Record<string, unknown> {
+   const registration = readServiceRegistration(configFile);
+   if (!registration) return { ok: true, installed: false, configFile };
+   const native = readDesktopSession(registration.workbuddyConfigDir, registration.sessionId);
+   const stateFile = path.join(registration.projectDir, "data", "persistent-service-status.json");
+-  let state: unknown;
++  let state: { pid?: number; updatedAt?: string; status?: string } | undefined;
+   try { state = JSON.parse(fs.readFileSync(stateFile, "utf8")); } catch { state = undefined; }
+   const status = registration.launchdLabel && uid !== undefined ? run(["print", `gui/${uid}/${registration.launchdLabel}`]) : undefined;
+   const workers=readWorkspaceWorkers(registeredServiceConfig(loadConfig(),registration),registration).map(worker=>({...worker,desktopRegistered:readDesktopSession(registration.workbuddyConfigDir,worker.sessionId).registered}));
+-  return { ok: true, installed: Boolean(registration.launchdLabel && registration.plistPath && fs.existsSync(registration.plistPath)), launchdLoaded: status?.status === 0, configFile, sessionId: registration.sessionId, workspace: registration.workspace, cdpPort: registration.cdpPort, desktopRegistered: workers.some(worker=>worker.state==='ready'&&worker.desktopRegistered), defaultDesktopRegistered:native.registered, workers, state };
++  // macOS proves liveness through launchd; the Windows service records its own pid.
++  const serviceAlive = typeof state?.pid === "number" && state.pid > 0 && isAlive(state.pid);
++  return { ok: true, installed: registration.launchdLabel ? Boolean(registration.plistPath && fs.existsSync(registration.plistPath)) : Boolean(registration.sessionId && fs.existsSync(configFile)), launchdLoaded: registration.launchdLabel ? status?.status === 0 : serviceAlive, configFile, sessionId: registration.sessionId, workspace: registration.workspace, cdpPort: registration.cdpPort, desktopRegistered: workers.some(worker=>worker.state==='ready'&&worker.desktopRegistered), defaultDesktopRegistered:native.registered, workers, state };
+ }
+ 
+ export function uninstallService(configFile: string, run: LaunchctlRunner = launchctl, uid = process.getuid?.()): Record<string, unknown> {
+@@ -135,6 +189,14 @@ export function uninstallService(configFile: string, run: LaunchctlRunner = laun
+     const result = run(["bootout", target]);
+     if (result.status !== 0 && run(["print", target]).status === 0) throw new Error("The persistent service could not be unloaded; its registration was preserved");
+   }
++  if (!registration.launchdLabel && WINDOWS) {
++    const stateFile = path.join(registration.projectDir, "data", "persistent-service-status.json");
++    try {
++      const state = JSON.parse(fs.readFileSync(stateFile, "utf8")) as { pid?: number };
++      if (typeof state.pid === "number" && state.pid > 0 && isAlive(state.pid)) spawnSync("taskkill", ["/PID", String(state.pid)], { timeout: 10_000 });
++    } catch { /* A missing or unreadable status file just means there is nothing to stop. */ }
++    fs.rmSync(windowsStartupEntry(registration.projectDir), { force: true });
++  }
+   const current = environmentValue(run);
+   let environmentRestored = false;
+   // Do not overwrite a later environment change made outside this installation.
+@@ -152,7 +214,9 @@ async function runService(configFile: string): Promise<void> {
+   const registration = readServiceRegistration(configFile);
+   if (!registration) throw new Error("Persistent service registration is missing; run install first");
+   const config = registeredServiceConfig(loadConfig(), registration);
+-  checked(launchctl, ["setenv", DEBUG_ENV, String(registration.cdpPort)]);
++  // launchd carries the debug switch into new WorkBuddy launches on macOS; on
++  // Windows the trigger passes it to the process it starts itself.
++  if (process.platform === "darwin") checked(launchctl, ["setenv", DEBUG_ENV, String(registration.cdpPort)]);
+   // Dynamic factory keeps the service testable without importing native/CDP machinery.
+   const module = await import(new URL("./native-desktop-trigger.js", import.meta.url).href) as { createNativeDesktopTrigger?: (config: Config, options: { cdpPort: number }) => NativeDesktopTrigger | Promise<NativeDesktopTrigger> };
+   if (typeof module.createNativeDesktopTrigger !== "function") throw new Error("The native desktop trigger factory is unavailable; rebuild the complete project");
